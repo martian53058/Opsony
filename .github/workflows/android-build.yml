@@ -1,0 +1,105 @@
+name: Android and KernelSU build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opsony-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build APK and KernelSU ZIP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Reconstruct source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ops-source
+          cat .ops-source/part-01.bin .ops-source/part-02.bin .ops-source/part-03.bin .ops-source/part-04.bin > /tmp/opsony-source.tar.gz.part
+          base64 --decode .ops-source/part-05.b64 >> /tmp/opsony-source.tar.gz.part
+          gzip -t /tmp/opsony-source.tar.gz.part
+          tar -tzf /tmp/opsony-source.tar.gz.part >/dev/null
+          tar -xzf /tmp/opsony-source.tar.gz.part --no-same-owner
+          test -f build-module.sh
+          test -f android-app/app/src/main/AndroidManifest.xml
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle 9.6.0
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.6.0'
+          cache-provider: basic
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android API 37 and Build Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platform-tools' 'platforms;android-37' 'build-tools;36.0.0'
+          test -f "$ANDROID_SDK_ROOT/platforms/android-37/android.jar"
+          test -x "$ANDROID_SDK_ROOT/build-tools/36.0.0/aapt"
+
+      - name: Validate shell scripts and XML
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n build-module.sh
+          bash -n tests/run-module-shell-tests.sh
+          bash tests/run-module-shell-tests.sh
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          for path in Path('.').rglob('*.xml'):
+              ET.parse(path)
+              print(f'XML OK: {path}')
+          PY
+
+      - name: Build debug APK and KernelSU module
+        shell: bash
+        run: |
+          set -euo pipefail
+          source tools/env.sh
+          ./build-module.sh
+
+      - name: Verify outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find android-app/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          ZIP="$(find dist -maxdepth 1 -type f -name '*.zip' | head -n 1)"
+          test -n "$APK" && test -s "$APK"
+          test -n "$ZIP" && test -s "$ZIP"
+          unzip -t "$ZIP"
+          sha256sum "$APK" "$ZIP" | tee dist/SHA256SUMS.txt
+          echo "APK=$APK"
+          echo "KSU_ZIP=$ZIP"
+
+      - name: Upload APK and KernelSU module
+        uses: actions/upload-artifact@v7
+        with:
+          name: Opsony-OP13-Android-API37
+          path: |
+            android-app/app/build/outputs/apk/**/*.apk
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
